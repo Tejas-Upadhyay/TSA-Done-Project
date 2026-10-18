@@ -28,8 +28,18 @@ const int MAX_THROTTLE = 2000;
 const int ARM_THROTTLE = 1000;
 
 // State
-enum DroneMode { NORMAL_MODE, SETUP_MODE };
+// Set true to enter diagnostics on every boot, before any ESC initialization.
+const bool DEBUG_ON_BOOT = false;
+enum DroneMode { NORMAL_MODE, SETUP_MODE, DEBUG_MODE };
 DroneMode currentMode = NORMAL_MODE;
+String serialCommand;
+bool serialOverflow = false;
+bool debugStreaming = false;
+unsigned long lastDebugSample = 0;
+
+void enterDebugMode();
+void pollSerialCommands();
+void printDebugSample();
 
 // Timing
 unsigned long previousMillis = 0;
@@ -65,6 +75,16 @@ void setup() {
 
   // Initialize I2C
   Wire.begin(21, 22);  // SDA=GPIO21, SCL=GPIO22
+  Wire.setTimeOut(50);
+
+  Serial.println("Type debug + Enter within 3 seconds for motor-disabled diagnostics.");
+  if (DEBUG_ON_BOOT) enterDebugMode();
+  unsigned long debugWindow = millis();
+  while (currentMode != DEBUG_MODE && millis() - debugWindow < 3000) {
+    pollSerialCommands();
+    delay(1);
+  }
+  if (currentMode == DEBUG_MODE) return;
 
   // ===== MPU6050 Detection =====
   Serial.println("Initializing MPU6050...");
@@ -115,6 +135,11 @@ void setup() {
 }
 
 void loop() {
+  pollSerialCommands();
+  if (currentMode == DEBUG_MODE && debugStreaming && millis() - lastDebugSample >= 250) {
+    lastDebugSample = millis();
+    printDebugSample();
+  }
   // Main loop - minimal for now, mode-specific handling in respective functions
   // Could add normal flight stabilization loop here later
   delay(10);
@@ -313,6 +338,10 @@ void calibrateGyro() {
 // ===== MOTOR CONTROL =====
 void setMotor(int motorIndex, int microseconds) {
   if (motorIndex < 0 || motorIndex > 3) return;
+  if (currentMode == DEBUG_MODE || microseconds <= 0) {
+    digitalWrite(motorPins[motorIndex], LOW);
+    return;
+  }
   
   // Generate PWM signal
   // Standard ESC PWM: 1000-2000µs
@@ -350,4 +379,115 @@ void flashErrorLED(int pattern) {
     delay(100);
   }
   Serial.println();
+}
+
+// ===== SERIAL DEBUG MODE (115200 baud) =====
+void enterDebugMode() {
+  currentMode = DEBUG_MODE;
+  debugStreaming = false;
+  for (int i = 0; i < 4; i++) digitalWrite(motorPins[i], LOW);
+  Serial.println("\n=== DEBUG MODE: motor signals disabled ===");
+  Serial.println("Commands: help, status, scan, imu, stream on, stream off");
+  Serial.println("Reset the board to leave debug mode.");
+}
+
+bool readDebugRegisters(uint8_t reg, uint8_t *data, uint8_t count) {
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom((uint8_t)MPU6050_ADDR, count) != count) return false;
+  for (uint8_t i = 0; i < count; i++) data[i] = Wire.read();
+  return true;
+}
+
+void printDebugSample() {
+  // Wake the device; explicitly select +/-2g and +/-250 degrees/second.
+  const uint8_t registers[] = {0x6B, 0x1B, 0x1C};
+  for (uint8_t i = 0; i < 3; i++) {
+    Wire.beginTransmission(MPU6050_ADDR);
+    Wire.write(registers[i]);
+    Wire.write(0);
+    if (Wire.endTransmission() != 0) {
+      Serial.println("IMU ERROR: MPU6050 did not acknowledge at 0x68.");
+      return;
+    }
+  }
+  delay(10);
+  uint8_t identity;
+  uint8_t data[14];
+  if (!readDebugRegisters(0x75, &identity, 1) || identity != 0x68 ||
+      !readDebugRegisters(0x3B, data, sizeof(data))) {
+    Serial.println("IMU ERROR: identity mismatch or incomplete sensor read.");
+    return;
+  }
+  int16_t values[7];
+  for (int i = 0; i < 7; i++) {
+    values[i] = (int16_t)(((uint16_t)data[2 * i] << 8) | data[2 * i + 1]);
+  }
+  Serial.print("Accel g [X Y Z]: ");
+  for (int i = 0; i < 3; i++) { Serial.print(values[i] / 16384.0f, 3); Serial.print(' '); }
+  Serial.print(" | Gyro deg/s [X Y Z]: ");
+  for (int i = 4; i < 7; i++) { Serial.print(values[i] / 131.0f, 2); Serial.print(' '); }
+  Serial.print(" | Temp C: ");
+  Serial.println(values[3] / 340.0f + 36.53f, 2);
+}
+
+void pollSerialCommands() {
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\r' || c == '\n') {
+      if (serialOverflow) {
+        serialOverflow = false;
+        serialCommand = "";
+        Serial.println("Command too long; type help.");
+        continue;
+      }
+      serialCommand.trim();
+      serialCommand.toLowerCase();
+      if (serialCommand == "debug") {
+        enterDebugMode();
+      } else if (serialCommand.length() && currentMode == DEBUG_MODE) {
+        if (serialCommand == "help") {
+          Serial.println("help | status | scan | imu | stream on | stream off; reset to exit");
+        } else if (serialCommand == "status") {
+          Serial.print("DEBUG; motor signals LOW; uptime ms: ");
+          Serial.print(millis());
+          Serial.print("; streaming: ");
+          Serial.println(debugStreaming ? "on" : "off");
+          Serial.println("I2C SDA=21 SCL=22; MPU address=0x68; motors FL=12 FR=13 BL=14 BR=15");
+        } else if (serialCommand == "imu") {
+          printDebugSample();
+        } else if (serialCommand == "stream on") {
+          debugStreaming = true;
+          Serial.println("Sensor stream enabled (250 ms interval).");
+        } else if (serialCommand == "stream off") {
+          debugStreaming = false;
+          Serial.println("Sensor stream disabled.");
+        } else if (serialCommand == "scan") {
+          int found = 0;
+          for (uint8_t address = 1; address < 127; address++) {
+            Wire.beginTransmission(address);
+            if (Wire.endTransmission() == 0) {
+              Serial.print("I2C device: 0x");
+              Serial.println(address, HEX);
+              found++;
+            }
+          }
+          Serial.print("Devices found: ");
+          Serial.println(found);
+        } else {
+          Serial.println("Unknown command. Type help.");
+        }
+      }
+      serialCommand = "";
+    } else if (serialOverflow) {
+      continue;
+    } else if (serialCommand.length() < 48) {
+      serialCommand += c;
+    } else {
+      // Discard the entire line even when it arrives across multiple loop calls.
+      serialCommand = "";
+      serialOverflow = true;
+    }
+  }
 }
