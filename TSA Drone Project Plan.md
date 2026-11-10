@@ -1,3 +1,5 @@
+> Historical concept plan. The current implementation and test procedure are in [README.md](README.md). The automatic motor tests and GPS/RTL modes described below are not implemented by the current controller; do not use this plan as a bench-test procedure.
+
 # TSA Drone Project Plan
 
 ## Parts List
